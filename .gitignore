@@ -1,0 +1,45 @@
+# Gizli bilgiler — ASLA commit etme
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.*
+credentials.*
+
+# Veritabanı (her ortamda kendi içinde oluşur)
+data/*.db
+data/*.db-journal
+data/*.sqlite
+data/*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editör / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+
+# Dağıtım artefaktları
+build/
+dist/
+*.egg-info/

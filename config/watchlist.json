@@ -1,0 +1,18 @@
+{
+  "stocks": [
+    {"symbol": "AAPL",  "name": "Apple Inc.",            "sector": "Technology"},
+    {"symbol": "MSFT",  "name": "Microsoft Corp.",       "sector": "Technology"},
+    {"symbol": "GOOGL", "name": "Alphabet Inc.",         "sector": "Communication"},
+    {"symbol": "AMZN",  "name": "Amazon.com Inc.",       "sector": "Consumer Cyclical"},
+    {"symbol": "NVDA",  "name": "NVIDIA Corp.",          "sector": "Technology"},
+    {"symbol": "META",  "name": "Meta Platforms Inc.",   "sector": "Communication"},
+    {"symbol": "TSLA",  "name": "Tesla Inc.",            "sector": "Consumer Cyclical"}
+  ],
+  "commodities": [
+    {"symbol": "GLD", "name": "SPDR Gold Shares",                "underlying": "Altın"},
+    {"symbol": "SLV", "name": "iShares Silver Trust",            "underlying": "Gümüş"},
+    {"symbol": "USO", "name": "United States Oil Fund",          "underlying": "Petrol (WTI)"},
+    {"symbol": "UNG", "name": "United States Natural Gas Fund",  "underlying": "Doğalgaz"},
+    {"symbol": "DBA", "name": "Invesco DB Agriculture Fund",     "underlying": "Tarım emtiaları"}
+  ]
+}
