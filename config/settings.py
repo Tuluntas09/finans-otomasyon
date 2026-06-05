@@ -28,6 +28,27 @@ WATCHLIST_PATH = ROOT / "config" / "watchlist.json"
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Istanbul")
 
+# ---------------------------------------------------------------- #
+# E-posta bildirimleri (isteğe bağlı — .env'e SMTP_ değerleri girilirse aktif)
+# ---------------------------------------------------------------- #
+SMTP_HOST:   str | None = os.getenv("SMTP_HOST")        # ör: smtp.gmail.com
+SMTP_PORT:   int        = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER:   str | None = os.getenv("SMTP_USER")        # gönderen e-posta
+SMTP_PASS:   str | None = os.getenv("SMTP_PASS")        # uygulama şifresi
+ALERT_EMAIL: str | None = os.getenv("ALERT_EMAIL")      # alıcı (boşsa SMTP_USER)
+
+# ---------------------------------------------------------------- #
+# Veri temizleme (retention) politikası — gün cinsinden
+# .env'den override edilebilir: RETENTION_SNAPSHOTS_DAYS=730 vb.
+# ---------------------------------------------------------------- #
+RETENTION_DAYS: dict[str, int] = {
+    "snapshots": int(os.getenv("RETENTION_SNAPSHOTS_DAYS", "365")),  # 1 yıl trend
+    "scores":    int(os.getenv("RETENTION_SCORES_DAYS",    "365")),  # snapshot ile senkron
+    "news":      int(os.getenv("RETENTION_NEWS_DAYS",      "90")),   # 90g sonra analitik değeri kalmaz
+    "alerts":    int(os.getenv("RETENTION_ALERTS_DAYS",    "180")),  # 6 aylık audit trail
+    "run_log":   int(os.getenv("RETENTION_RUNLOG_DAYS",    "90")),   # Ayarlar'da son 20 gösteriliyor
+}
+
 # Finnhub ücretsiz plan: 60 istek/dakika.
 # Güvenlik payı bırakıyoruz: 50 istek/dakika gibi davranıyoruz.
 RATE_LIMIT_PER_MINUTE = 50
@@ -114,18 +135,34 @@ NEWS_CATEGORIES: dict[str, list[str]] = {
 }
 
 # ---------------------------------------------------------------- #
-# Watchlist yükleme
+# Watchlist yükleme — module-level cache (her render'da dosya açılmıyor)
 # ---------------------------------------------------------------- #
+_wl_cache: dict[str, Any] | None = None
+_wl_mtime: float = 0.0
+
+
 def load_watchlist() -> dict[str, Any]:
-    """watchlist.json dosyasını oku."""
-    with open(WATCHLIST_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    """watchlist.json dosyasını oku. Dosya değişmemişse cache'den döner."""
+    global _wl_cache, _wl_mtime
+    import os
+    try:
+        mtime = os.path.getmtime(WATCHLIST_PATH)
+    except OSError:
+        mtime = 0.0
+    if _wl_cache is None or mtime != _wl_mtime:
+        with open(WATCHLIST_PATH, encoding="utf-8") as f:
+            _wl_cache = json.load(f)
+        _wl_mtime = mtime
+    return _wl_cache
 
 
 def save_watchlist(data: dict[str, Any]) -> None:
-    """watchlist.json dosyasına yaz (UI'dan değişiklik gelirse)."""
+    """watchlist.json dosyasına yaz ve cache'i temizle."""
+    global _wl_cache, _wl_mtime
     with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    _wl_cache = None   # invalidate — bir sonraki load_watchlist yeniden okur
+    _wl_mtime = 0.0
 
 
 def all_symbols() -> list[str]:

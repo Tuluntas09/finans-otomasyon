@@ -32,6 +32,8 @@ from core.finnhub_client import (
     RateLimited, get_client,
 )
 from core.news_analyzer import aggregate, enrich
+from core.notifier import is_configured as email_configured, send_alert_email
+from core.price_history import build_candles_from_yfinance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,9 +107,17 @@ def _process_symbol(client, sym: str, asset_kind: str, name: str) -> tuple[bool,
 
     try:
         candles = client.candles(sym, resolution="D", days_back=365)
+        # Ücretsiz plan'da Finnhub candle 403 döner — yfinance fallback
+        if not candles or candles.get("s") == "no_data" or not candles.get("c"):
+            raise FinnhubError("candle boş — yfinance'e geçiliyor")
     except FinnhubError as e:
-        log.warning("%s: candles alınamadı (%s)", sym, e)
-        candles = {}
+        log.info("%s: candles Finnhub'dan alınamadı (%s), yfinance deneniyor", sym, e)
+        candles = build_candles_from_yfinance(sym, days=365)
+        if candles.get("s") == "ok":
+            log.info("%s: yfinance candle OK (%d bar)", sym, len(candles.get("c", [])))
+        else:
+            log.warning("%s: yfinance de başarısız, candles boş", sym)
+            candles = {}
 
     # Haberler — sentiment'a göre enrich et, DB'ye yaz
     news_added = 0
@@ -208,6 +218,31 @@ def run_snapshot() -> dict[str, Any]:
     )
     db.log_run_end(run_id, status, detail)
     log.info("Bitti: %s", detail)
+
+    # ── Veri temizleme (retention politikası) ──────────────────────
+    try:
+        purged = db.purge_old_data()
+        total_purged = sum(purged.values())
+        if total_purged > 0:
+            log.info("Temizlendi: %s", purged)
+        summary["purged"] = purged
+    except Exception as exc:
+        log.warning("Veri temizleme başarısız (kritik değil): %s", exc)
+        summary["purged"] = {}
+
+    # ── E-posta: yeni uyarılar varsa gönder ────────────────────────
+    if email_configured():
+        new_alerts = db.recent_alerts(limit=20)
+        # Yalnızca bu run'da oluşan uyarıları seç (started'den sonra)
+        started_iso = started.isoformat(timespec="seconds")
+        fresh = [a for a in new_alerts
+                 if (a.get("created_at") or "") >= started_iso]
+        if fresh:
+            sent = send_alert_email(fresh, summary=summary)
+            log.info("E-posta: %s (%d uyarı)", "gönderildi" if sent else "başarısız", len(fresh))
+        else:
+            log.info("E-posta: bu çalıştırmada yeni uyarı yok")
+
     return summary
 
 

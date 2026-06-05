@@ -88,23 +88,107 @@ CREATE TABLE IF NOT EXISTS run_log (
 );
 """
 
+# ---------------------------------------------------------------- #
+# Schema Migration Sistemi
+# ---------------------------------------------------------------- #
+CURRENT_SCHEMA_VERSION = 1
+
+# Her versiyon → uygulanacak SQL listesi.
+# Kural: sadece EKLE, değiştirme/silme yapma.
+# Yeni sütun örneği: "ALTER TABLE snapshots ADD COLUMN data_source TEXT DEFAULT 'finnhub'"
+MIGRATIONS: dict[int, list[str]] = {
+    1: [],   # Başlangıç versiyonu — mevcut tablolar zaten var (IF NOT EXISTS idempotent)
+             # Boş liste: yalnızca schema_version=1 kaydı yazar.
+    # 2: ["ALTER TABLE snapshots ADD COLUMN data_source TEXT DEFAULT 'finnhub'"],
+    # 3: [...],
+}
+
+_SCHEMA_VERSION_DDL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version     INTEGER PRIMARY KEY,
+    applied_at  TEXT NOT NULL,
+    description TEXT
+);
+"""
+
+
+def _get_db_version(c: sqlite3.Connection) -> int:
+    """Mevcut DB şema versiyonunu döndür. Tablo yoksa 0."""
+    try:
+        row = c.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+        return int(row["v"]) if row and row["v"] is not None else 0
+    except sqlite3.OperationalError:
+        return 0  # schema_version tablosu henüz yok
+
+
+def _apply_migrations(c: sqlite3.Connection) -> None:
+    """
+    Eksik migration'ları sırayla uygula.
+    Her migration kendi transaction'ında — başarısız olursa rollback + exception.
+    """
+    # schema_version tablosunu garantiye al
+    c.executescript(_SCHEMA_VERSION_DDL)
+    c.commit()
+
+    current = _get_db_version(c)
+
+    for version in sorted(MIGRATIONS.keys()):
+        if version <= current:
+            continue   # zaten uygulanmış
+
+        try:
+            for sql in MIGRATIONS[version]:
+                c.execute(sql)
+            c.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _now_iso()),
+            )
+            c.commit()
+        except Exception as exc:
+            c.rollback()
+            raise RuntimeError(
+                f"Migration v{version} başarısız: {exc}  "
+                f"(DB v{current}'de kaldı)"
+            ) from exc
+
 
 def init_db() -> None:
-    """Veritabanını oluştur ve şemayı uygula. Idempotent."""
+    """Veritabanını oluştur, şemayı ve migration'ları uygula. Idempotent."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with conn() as c:
-        c.executescript(SCHEMA)
+    # conn() kullanmıyoruz: migration kendi transaction kontrolünü yönetmeli
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode = WAL")
+    c.execute("PRAGMA foreign_keys = ON")
+    try:
+        c.executescript(SCHEMA)       # CREATE TABLE IF NOT EXISTS — backward compat
+        _apply_migrations(c)
+    finally:
+        c.close()
 
 
 @contextmanager
 def conn() -> Iterator[sqlite3.Connection]:
-    """Bağlam yöneticisi — auto commit + auto close."""
-    c = sqlite3.connect(DB_PATH)
+    """
+    Bağlam yöneticisi — WAL mode, busy timeout, auto commit + rollback + close.
+
+    WAL (Write-Ahead Logging): reader ve writer birbirini bloklamaz.
+    GitHub Actions cron job + Streamlit eş zamanlı çalıştığında 'database is locked'
+    hatasını önler.
+    """
+    c = sqlite3.connect(DB_PATH, timeout=30)        # OS-level 30s retry
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys = ON")
+    c.execute("PRAGMA journal_mode = WAL")           # reader/writer çakışmasını engeller
+    c.execute("PRAGMA busy_timeout = 5000")          # SQLite-level 5 sn bekle
+    c.execute("PRAGMA foreign_keys = ON")            # FK kısıtlamaları
+    c.execute("PRAGMA wal_autocheckpoint = 1000")    # WAL şişmesini önler
+    c.execute("PRAGMA synchronous = NORMAL")         # performans/güvenlik dengesi
     try:
         yield c
         c.commit()
+    except Exception:
+        c.rollback()    # hata durumunda yarım transaction'ı geri al
+        raise
     finally:
         c.close()
 
@@ -187,13 +271,24 @@ def score_history(symbol: str, days: int = 90) -> list[dict[str, Any]]:
 
 
 def latest_for_all(symbols: list[str]) -> dict[str, dict[str, Any]]:
-    """Birden çok sembol için en son snapshot."""
-    out: dict[str, dict[str, Any]] = {}
-    for s in symbols:
-        snap = latest_snapshot(s)
-        if snap:
-            out[s] = snap
-    return out
+    """Birden çok sembol için en son snapshot — tek SQL sorgusuyla."""
+    if not symbols:
+        return {}
+    placeholders = ",".join("?" * len(symbols))
+    with conn() as c:
+        rows = c.execute(
+            f"""SELECT s.*
+                FROM snapshots s
+                INNER JOIN (
+                    SELECT symbol, MAX(captured_at) AS max_at
+                    FROM snapshots
+                    WHERE symbol IN ({placeholders})
+                    GROUP BY symbol
+                ) latest ON s.symbol = latest.symbol
+                         AND s.captured_at = latest.max_at""",
+            symbols,
+        ).fetchall()
+    return {dict(r)["symbol"]: dict(r) for r in rows}
 
 
 # ---------------------------------------------------------------- #
@@ -317,3 +412,102 @@ def last_run(job_name: str) -> dict[str, Any] | None:
             (job_name,),
         ).fetchone()
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------------- #
+# Veri Retention (Temizleme)
+# ---------------------------------------------------------------- #
+def purge_old_data(retention: dict[str, int] | None = None) -> dict[str, int]:
+    """
+    Retention politikasına göre eski verileri sil.
+
+    Args:
+        retention: {'snapshots': 365, 'news': 90, ...}
+                   None verilirse config.settings.RETENTION_DAYS kullanılır.
+
+    Returns:
+        Silinen satır sayıları: {'snapshots': 12, 'news': 450, ...}
+    """
+    from config.settings import RETENTION_DAYS
+    ret = retention or RETENTION_DAYS
+
+    # tablo → (tarih sütunu, varsayılan gün)
+    _TABLE_CFG: list[tuple[str, str, int]] = [
+        ("snapshots", "captured_at",  ret.get("snapshots", 365)),
+        ("scores",    "captured_at",  ret.get("scores",    365)),
+        ("news",      "published_at", ret.get("news",      90)),
+        ("alerts",    "created_at",   ret.get("alerts",    180)),
+        ("run_log",   "started_at",   ret.get("run_log",   90)),
+    ]
+
+    deleted: dict[str, int] = {}
+    with conn() as c:
+        for table, date_col, days in _TABLE_CFG:
+            try:
+                cur = c.execute(
+                    f"DELETE FROM {table} WHERE {date_col} < datetime('now', ?)",
+                    (f"-{days} days",),
+                )
+                deleted[table] = cur.rowcount
+            except sqlite3.OperationalError:
+                deleted[table] = 0   # tablo henüz yoksa sessizce geç
+    return deleted
+
+
+# ---------------------------------------------------------------- #
+# DB İstatistikleri (Health Check)
+# ---------------------------------------------------------------- #
+def db_stats() -> dict[str, Any]:
+    """
+    Veritabanı sağlık bilgilerini toplar.
+
+    Returns:
+        file_size_kb, wal_size_kb, schema_version, integrity_ok,
+        null_score_count, tables: {tablo: {count, latest, oldest}}
+    """
+    stats: dict[str, Any] = {}
+
+    db_path = Path(DB_PATH)
+    stats["file_size_kb"] = (round(db_path.stat().st_size / 1024, 1)
+                             if db_path.exists() else 0)
+    wal_path = Path(str(DB_PATH) + "-wal")
+    stats["wal_size_kb"]  = (round(wal_path.stat().st_size / 1024, 1)
+                             if wal_path.exists() else 0)
+
+    _table_date_cols = {
+        "snapshots": "captured_at",
+        "news":      "published_at",
+        "scores":    "captured_at",
+        "alerts":    "created_at",
+        "run_log":   "started_at",
+    }
+
+    with conn() as c:
+        tables: dict[str, dict[str, Any]] = {}
+        for table, date_col in _table_date_cols.items():
+            try:
+                row = c.execute(
+                    f"""SELECT COUNT(*) as cnt,
+                               MAX({date_col}) as latest,
+                               MIN({date_col}) as oldest
+                        FROM {table}"""
+                ).fetchone()
+                tables[table] = {
+                    "count":  row["cnt"],
+                    "latest": row["latest"],
+                    "oldest": row["oldest"],
+                }
+            except sqlite3.OperationalError:
+                tables[table] = {"count": 0, "latest": None, "oldest": None}
+        stats["tables"] = tables
+
+        stats["schema_version"] = _get_db_version(c)
+
+        result = c.execute("PRAGMA quick_check").fetchone()
+        stats["integrity_ok"] = (result[0] == "ok")
+
+        stats["null_score_count"] = c.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE overall_score IS NULL"
+        ).fetchone()[0]
+
+    return stats

@@ -241,8 +241,14 @@ _client: FinnhubClient | None = None
 
 
 def get_client() -> FinnhubClient:
-    """Tek paylaşımlı istemci. Anahtar değişirse yeniden kur."""
+    """Tek paylaşımlı istemci. Anahtar değişirse yeniden kur.
+
+    settings.FINNHUB_API_KEY'i doğrudan okur (runtime'da Streamlit secrets
+    veya _resolve_api_key() tarafından güncellenmiş olabilir).
+    """
     global _client
-    if _client is None or _client.api_key != FINNHUB_API_KEY:
-        _client = FinnhubClient()
+    import config.settings as _s
+    live_key = _s.FINNHUB_API_KEY
+    if _client is None or _client.api_key != live_key:
+        _client = FinnhubClient(api_key=live_key)
     return _client
